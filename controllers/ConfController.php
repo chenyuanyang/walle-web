@@ -11,7 +11,6 @@ use app\models\User;
 use app\models\Group;
 use app\components\GlobalHelper;
 
-
 class ConfController extends Controller
 {
 
@@ -22,7 +21,7 @@ class ConfController extends Controller
     public function beforeAction($action) {
         parent::beforeAction($action);
         if (!GlobalHelper::isValidAdmin()) {
-            throw new \Exception('项目管理员尚未通过其它项目管理员的审核，无操作项目权限：）');
+            throw new \Exception(yii::t('conf', 'you are not active'));
         }
         return true;
     }
@@ -32,8 +31,12 @@ class ConfController extends Controller
      *
      */
     public function actionIndex() {
+
+        // 显示该用户为管理员的所有项目
         $project = Project::find()
-            ->where(['user_id' => $this->uid]);
+            ->leftJoin(Group::tableName(), '`group`.`project_id`=`project`.`id`')
+            ->where(['`group`.`user_id`' => $this->uid, '`group`.`type`' => Group::TYPE_ADMIN]);
+
         $kw = \Yii::$app->request->post('kw');
         if ($kw) {
             $project->andWhere(['like', "name", $kw]);
@@ -117,12 +120,20 @@ class ConfController extends Controller
      * @throws \Exception
      */
     public function actionEdit($projectId = null) {
-        $project = $projectId ? $this->findModel($projectId) : new Project();
+        if ($projectId) {
+            $project = $this->findModel($projectId);
+        } else {
+            $project = new Project();
+            $project->loadDefaultValues();
+        }
 
         if (\Yii::$app->request->getIsPost() && $project->load(Yii::$app->request->post())) {
             $project->user_id = $this->uid;
+
             if ($project->save()) {
-                $this->redirect('/conf/');
+                // 保存ansible需要的hosts文件
+                $this->_saveAnsibleHosts($project);
+                $this->redirect('@web/conf/');
             }
         }
 
@@ -144,7 +155,13 @@ class ConfController extends Controller
         $copy = new Project();
         $copy->load($project->getAttributes(), '');
 
-        if (!$copy->save()) throw new \Exception('复制项目失败');
+        if (!$copy->save()) throw new \Exception(yii::t('conf', 'copy failed'));
+
+        // 删除ansible配置文件
+        if ($project->ansible) {
+            copy(Project::getAnsibleHostsFile($project->id), Project::getAnsibleHostsFile($copy->id));
+        }
+
         $this->renderJson([]);
     }
 
@@ -156,7 +173,14 @@ class ConfController extends Controller
      */
     public function actionDelete($projectId) {
         $project = $this->findModel($projectId);
-        if (!$project->delete()) throw new \Exception('删除失败');
+
+        if (!$project->delete()) throw new \Exception(yii::t('w', 'delete failed'));
+
+        // 删除ansible配置文件
+        if ($project->ansible) {
+            unlink(Project::getAnsibleHostsFile($project->id));
+        }
+
         $this->renderJson([]);
     }
 
@@ -169,14 +193,11 @@ class ConfController extends Controller
     public function actionDeleteRelation($id) {
         $group = Group::findOne($id);
         if (!$group) {
-            throw new \Exception('关系不存在：）');
+            throw new \Exception(yii::t('conf', 'relation not exists'));
         }
-        $project = Project::findOne($group->project_id);
-        if ($project->user_id != $this->uid) {
-            throw new \Exception('不可以操作其它人的项目：）');
-        }
+        $project = $this->findModel($group->project_id);
 
-        if (!$group->delete()) throw new \Exception('删除失败');
+        if (!$group->delete()) throw new \Exception(yii::t('w', 'delete failed'));
         $this->renderJson([]);
     }
 
@@ -189,17 +210,14 @@ class ConfController extends Controller
     public function actionEditRelation($id, $type = 0) {
         $group = Group::findOne($id);
         if (!$group) {
-            throw new \Exception('关系不存在：）');
+            throw new \Exception(yii::t('conf', 'relation not exists'));
         }
-        $project = Project::findOne($group->project_id);
-        if ($project->user_id != $this->uid) {
-            throw new \Exception('不可以操作其它人的项目：）');
-        }
+        $project = $this->findModel($group->project_id);
         if (!in_array($type, [Group::TYPE_ADMIN, Group::TYPE_USER])) {
-            throw new \Exception('未知的关系类型：）');
+            throw new \Exception(yii::t('conf', 'unknown relation type'));
         }
         $group->type = (int)$type;
-        if (!$group->save()) throw new \Exception('更新失败');
+        if (!$group->save()) throw new \Exception(yii::t('w', 'update failed'));
         $this->renderJson([]);
     }
 
@@ -212,12 +230,35 @@ class ConfController extends Controller
      */
     protected function findModel($id) {
         if (($model = Project::getConf($id)) !== null) {
-            if ($model->user_id != $this->uid) {
-                throw new \Exception('不可以操作其它人的项目：）');
+            //判断是否为管理员
+            if(!Group::isAuditAdmin($this->uid, $model->id)){
+                throw new \Exception(yii::t('w', 'you are not admin of project'));
             }
             return $model;
         } else {
-            throw new NotFoundHttpException('该项目不存在：）');
+            throw new NotFoundHttpException(yii::t('conf', 'project not exists'));
         }
     }
+
+    /**
+     * @param Project $project
+     * @return bool
+     * @throws \Exception
+     */
+    protected function _saveAnsibleHosts(Project $project) {
+
+        if (!$project->ansible) {
+            // 未开启ansible, 不用保存
+            return true;
+        }
+
+        $filePath = Project::getAnsibleHostsFile($project->id);
+        $ret = @file_put_contents($filePath, $project->hosts);
+        if (!$ret) {
+            throw new \Exception(yii::t('conf', 'ansible hosts save error', ['path' => $filePath]));
+        }
+
+        return true;
+    }
+
 }
